@@ -1,267 +1,595 @@
+#!/usr/bin/env python3
 import argparse
-import collections
 import configparser
-from datetime import datetime
-import grp, pwd
-from fnmatch import fnmatch
 import hashlib
-from math import ceil
 import os
 import re
 import sys
 import zlib
+from collections import OrderedDict
 
-argparser = argparse.ArgumentParser(description = "Content tracker")
-argsubparsers = argparser.add_subparsers(title= "Commands", dest = "command")
-argsubparsers.required = True
 
-class GitRepository (object):
-    # A git repository
+def locate_git_path(repository, *subpaths):
+    """Compute a path inside the repository's .git directory."""
+    return os.path.join(repository.git_directory, *subpaths)
 
-    worktree = None
-    gitdir = None
-    conf = None
 
-    def __init__(self, path, force=False):
-        self.worktree = path
-        self.gitdir = os.path.join(path, ".git")
+def ensure_git_directory(repository, *subpaths, create=False):
+    """
+    Similar to locate_git_path, but also creates the directory if requested.
+    """
+    potential_path = locate_git_path(repository, *subpaths)
+    if os.path.exists(potential_path):
+        if os.path.isdir(potential_path):
+            return potential_path
+        raise Exception("Path is not a directory: {}".format(potential_path))
+    if create:
+        os.makedirs(potential_path)
+    return potential_path
 
-        if not (force or os.path.isdir(self.gitdir)):
-            raise Exception("Not a Git repository %s" % path)
 
-        # Read configuration file in .git/config
-        self.conf = configparser.ConfigParser()
-        cf = repo_file(self, "config")
+def ensure_git_file(repository, *subpaths, create=False):
+    """
+    Similar to locate_git_path, but creates the containing directory if needed.
+    """
+    if ensure_git_directory(repository, *subpaths[:-1], create=create):
+        return locate_git_path(repository, *subpaths)
 
-        if cf and os.path.exists(cf):
-            self.conf.read([cf])
+
+class SimpleRepository:
+    """A minimalist representation of a Git-like repository."""
+
+    def __init__(self, root_path, force=False):
+        self.workspace = root_path
+        self.git_directory = os.path.join(root_path, ".git")
+
+        if not (force or os.path.isdir(self.git_directory)):
+            raise Exception("Not a valid Git repository at {}".format(root_path))
+
+        # Load config file
+        self.config_parser = configparser.ConfigParser()
+        config_location = ensure_git_file(self, "config")
+        if config_location and os.path.exists(config_location):
+            self.config_parser.read([config_location])
         elif not force:
-            raise Exception("Configuration file missing")
+            raise Exception("Missing configuration file in .git/config")
 
         if not force:
-            vers = int(self.conf.get("core", "repositoryformatversion"))
-            if vers != 0:
-                raise Exception("Unsupported repositoryformatversion %s" % vers)
+            repo_format_version = int(self.config_parser.get("core", "repositoryformatversion"))
+            if repo_format_version != 0:
+                raise Exception("Unsupported repository format version: {}".format(repo_format_version))
 
-def repo_path(repo, *path):
-    """Compute path under repo's gitdir."""
-    return os.path.join(repo.gitdir, *path)
 
-def repo_file(repo, *path, mkdir=False):
-    """Same as repo_path, but create dirname(*path) if absent.  For
-example, repo_file(r, \"refs\", \"remotes\", \"origin\", \"HEAD\") will create
-.git/refs/remotes/origin."""
+def create_repo(target_path):
+    """
+    Initialize a new repository in the specified directory.
+    """
+    new_repo = SimpleRepository(target_path, force=True)
 
-    if repo_dir(repo, *path[:-1], mkdir=mkdir):
-        return repo_path(repo, *path)
-
-def repo_dir(repo, *path, mkdir=False):
-    """Same as repo_path, but mkdir *path if absent if mkdir."""
-
-    path = repo_path(repo, *path)
-
-    if os.path.exists(path):
-        if (os.path.isdir(path)):
-            return path
-        else:
-            raise Exception("Not a directory %s" % path)
-
-    if mkdir:
-        os.makedirs(path)
-        return path
+    if os.path.exists(new_repo.workspace):
+        if not os.path.isdir(new_repo.workspace):
+            raise Exception("{} is not a folder!".format(new_repo.workspace))
+        if os.listdir(new_repo.workspace):
+            raise Exception("{} is not empty!".format(new_repo.workspace))
     else:
-        return None
+        os.makedirs(new_repo.workspace)
 
-def repo_create(path):
-    """Create a new repository at path."""
+    # Create .git structure
+    os.makedirs(new_repo.git_directory)
+    ensure_git_directory(new_repo, "branches", create=True)
+    ensure_git_directory(new_repo, "objects", create=True)
+    ensure_git_directory(new_repo, "refs", "tags", create=True)
+    ensure_git_directory(new_repo, "refs", "heads", create=True)
 
-    repo = GitRepository(path, True)
+    # Write initial description
+    with open(ensure_git_file(new_repo, "description"), "w") as desc_file:
+        desc_file.write("Unnamed repository; edit this file 'description' to name the repository.\n")
 
-    # First, we make sure the path either doesn't exist or is an
-    # empty dir.
+    # Write initial HEAD
+    with open(ensure_git_file(new_repo, "HEAD"), "w") as head_file:
+        head_file.write("ref: refs/heads/master\n")
 
-    if os.path.exists(repo.worktree):
-        if not os.path.isdir(repo.worktree):
-            raise Exception ("%s is not a directory!" % path)
-        if os.path.exists(repo.gitdir) and os.listdir(repo.gitdir):
-            raise Exception("%s is not empty!" % path)
-    else:
-        os.makedirs(repo.worktree)
+    # Write config
+    with open(ensure_git_file(new_repo, "config"), "w") as conf_file:
+        conf_file.write(default_repo_config())
 
-    assert repo_dir(repo, "branches", mkdir=True)
-    assert repo_dir(repo, "objects", mkdir=True)
-    assert repo_dir(repo, "refs", "tags", mkdir=True)
-    assert repo_dir(repo, "refs", "heads", mkdir=True)
+    return new_repo
 
-    # .git/description
-    with open(repo_file(repo, "description"), "w") as f:
-        f.write("Unnamed repository; edit this file 'description' to name the repository.\n")
 
-    # .git/HEAD
-    with open(repo_file(repo, "HEAD"), "w") as f:
-        f.write("ref: refs/heads/master\n")
+def default_repo_config():
+    """
+    Return a default configuration block for a newly created repository.
+    """
+    return (
+        "[core]\n"
+        "\trepositoryformatversion = 0\n"
+        "\tfilemode = false\n"
+        "\tbare = false\n"
+    )
 
-    with open(repo_file(repo, "config"), "w") as f:
-        config = repo_default_config()
-        config.write(f)
 
-    return repo
+def locate_existing_repo(starting_path=".", required=True):
+    """
+    Ascend from starting_path until a .git folder is located.
+    """
+    search_path = os.path.realpath(starting_path)
 
-def repo_default_config():
-    ret = configparser.ConfigParser()
+    if os.path.isdir(os.path.join(search_path, ".git")):
+        return SimpleRepository(search_path)
 
-    ret.add_section("core")
-    ret.set("core", "repositoryformatversion", "0")
-    ret.set("core", "filemode", "false")
-    ret.set("core", "bare", "false")
+    # Move to the parent directory
+    parent_path = os.path.realpath(os.path.join(search_path, ".."))
 
-    return ret
-
-argsp = argsubparsers.add_parser("init", help="Initialize a new, empty repository.")
-
-argsp.add_argument("path",
-                   metavar="directory",
-                   nargs="?",
-                   default=".",
-                   help="Where to create the repository.")
-
-def cmd_init(args):
-    repo_create(args.path)
-
-def repo_find(path=".", required=True):
-    path = os.path.realpath(path)
-
-    if os.path.isdir(os.path.join(path, ".git")):
-        return GitRepository(path)
-
-    # If we haven't returned, recurse in parent, if w
-    parent = os.path.realpath(os.path.join(path, ".."))
-
-    if parent == path:
-        # Bottom case
-        # os.path.join("/", "..") == "/":
-        # If parent==path, then path is root.
+    if parent_path == search_path:
+        # We have reached the top
         if required:
-            raise Exception("No git directory.")
-        else:
-            return None
-
-    # Recursive case
-    return repo_find(parent, required)
-
-class GitObject (object):
-
-    def __init__(self, data=None):
-        if data != None:
-            self.deserialize(data)
-        else:
-            self.init()
-
-    def serialize(self, repo):
-        """This function MUST be implemented by subclasses.
-
-It must read the object's contents from self.data, a byte string, and do
-whatever it takes to convert it into a meaningful representation.  What exactly that means depend on each subclass."""
-        raise Exception("Unimplemented!")
-
-    def deserialize(self, data):
-        raise Exception("Unimplemented!")
-
-    def init(self):
-        pass # Just do nothing. This is a reasonable default!
-
-def object_read(repo, sha):
-    """Read object sha from Git repository repo.  Return a
-    GitObject whose exact type depends on the object."""
-
-    path = repo_file(repo, "objects", sha[0:2], sha[2:])
-
-    if not os.path.isfile(path):
+            raise Exception("No .git directory found in any ancestor.")
         return None
 
-    with open (path, "rb") as f:
-        raw = zlib.decompress(f.read())
+    return locate_existing_repo(parent_path, required)
 
-        # Read object type
-        x = raw.find(b' ')
-        fmt = raw[0:x]
 
-        # Read and validate object size
-        y = raw.find(b'\x00', x)
-        size = int(raw[x:y].decode("ascii"))
-        if size != len(raw)-y-1:
-            raise Exception("Malformed object {0}: bad length".format(sha))
+def present_object(repository, object_name, expected_type=None):
+    """
+    Print the contents of an object to stdout.
+    """
+    git_obj = read_object(repository, find_object(repository, object_name, fmt=expected_type))
+    sys.stdout.buffer.write(git_obj.serialize())
 
-        # Pick constructor
-        match fmt:
-            case b'commit' : c=GitCommit
-            case b'tree'   : c=GitTree
-            case b'tag'    : c=GitTag
-            case b'blob'   : c=GitBlob
-            case _:
-                raise Exception("Unknown type {0} for object {1}".format(fmt.decode("ascii"), sha))
 
-        # Call constructor and return object
-        return c(raw[y+1:])
-    
-def object_write(obj, repo=None):
-    # Serialize object data
-    data = obj.serialize()
-    # Add header
-    result = obj.fmt + b' ' + str(len(data)).encode() + b'\x00' + data
-    # Compute hash
-    sha = hashlib.sha1(result).hexdigest()
+def read_object(repository, sha_identifier):
+    """
+    Decompress and parse an object from the repository by its SHA.
+    """
+    object_path = ensure_git_file(repository, "objects", sha_identifier[:2], sha_identifier[2:])
+    with open(object_path, "rb") as obj_stream:
+        decompressed = zlib.decompress(obj_stream.read())
 
-    if repo:
-        # Compute path
-        path=repo_file(repo, "objects", sha[0:2], sha[2:], mkdir=True)
+    # Format: "type size\0content"
+    header_end = decompressed.find(b' ')
+    obj_type = decompressed[:header_end]
 
-        if not os.path.exists(path):
-            with open(path, 'wb') as f:
-                # Compress and write
-                f.write(zlib.compress(result))
-    return sha
+    size_null = decompressed.find(b'\x00', header_end)
+    obj_size = int(decompressed[header_end + 1:size_null])
 
-class GitBlob(GitObject):
-    fmt=b'blob'
+    if obj_size != len(decompressed) - (size_null + 1):
+        raise Exception("Corrupted object {}: bad length".format(sha_identifier))
+
+    raw_content = decompressed[size_null + 1:]
+
+    if obj_type == b'commit':
+        return CommitObject(raw_content)
+    elif obj_type == b'tree':
+        return TreeObject(raw_content)
+    elif obj_type == b'tag':
+        return TagObject(raw_content)
+    elif obj_type == b'blob':
+        return BlobObject(raw_content)
+    else:
+        raise Exception("Unknown object type {} for {}".format(obj_type.decode("ascii"), sha_identifier))
+
+
+def find_object(repository, name, fmt=None, follow=True):
+    """
+    Locate an object by partial or full SHA-1 hash.
+    """
+    if not re.search(r"^[0-9A-Fa-f]{4,40}$", name):
+        raise Exception("Invalid object name: {}".format(name))
+
+    name = name.lower()
+    if len(name) == 40:
+        return name
+
+    # Partial SHA
+    potential_dir = ensure_git_directory(repository, "objects", name[:2], create=False)
+    if not potential_dir:
+        return None
+
+    remainder = name[2:]
+    for candidate in os.listdir(potential_dir):
+        if candidate.startswith(remainder):
+            return name[:2] + candidate
+
+    return None
+
+
+def write_object(git_object, repository):
+    """
+    Serialize and write a GitObject, returning its computed SHA-1.
+    """
+    content = git_object.serialize()
+    # Prepare header
+    header = git_object.obj_type + b' ' + str(len(content)).encode() + b'\x00' + content
+    sha_value = hashlib.sha1(header).hexdigest()
+
+    out_path = ensure_git_file(repository, "objects", sha_value[:2], sha_value[2:], create=True)
+    with open(out_path, "wb") as output_stream:
+        output_stream.write(zlib.compress(header))
+
+    return sha_value
+
+
+class GitObject:
+    """
+    Abstract base for different Git object types.
+    """
+
+    def __init__(self, raw_data=None):
+        if raw_data is not None:
+            self.deserialize(raw_data)
 
     def serialize(self):
-        return self.blobdata
+        raise NotImplementedError("Must be overridden in subclass.")
 
     def deserialize(self, data):
-        self.blobdata = data
-
-argsp = argsubparsers.add_parser("cat-file",
-                                 help="Provide content of repository objects")
-
-argsp.add_argument("type",
-                   metavar="type",
-                   choices=["blob", "commit", "tag", "tree"],
-                   help="Specify the type")
-
-argsp.add_argument("object",
-                   metavar="object",
-                   help="The object to display")
+        raise NotImplementedError("Must be overridden in subclass.")
 
 
+class BlobObject(GitObject):
+    obj_type = b'blob'
+
+    def serialize(self):
+        return self.content_data
+
+    def deserialize(self, data):
+        self.content_data = data
+
+
+class CommitObject(GitObject):
+    obj_type = b'commit'
+
+    def deserialize(self, data):
+        self.parsed_kvlm = parse_kvlm(data)
+
+    def serialize(self):
+        return serialize_kvlm(self.parsed_kvlm)
+
+
+class TreeObject(GitObject):
+    obj_type = b'tree'
+
+    def deserialize(self, data):
+        self.tree_entries = []
+        idx = 0
+        while idx < len(data):
+            space_idx = data.find(b' ', idx)
+            mode_str = data[idx:space_idx]
+            idx = space_idx + 1
+            null_idx = data.find(b'\x00', idx)
+            filename = data[idx:null_idx]
+            idx = null_idx + 1
+            raw_sha = data[idx:idx + 20]
+            idx += 20
+            self.tree_entries.append(
+                (mode_str.decode("ascii"), filename, raw_sha.hex())
+            )
+
+    def serialize(self):
+        result = b''
+        for mode, fname, sha_hex in self.tree_entries:
+            result += mode.encode("ascii") + b' ' + fname + b'\x00'
+            result += bytes.fromhex(sha_hex)
+        return result
+
+
+class TagObject(CommitObject):
+    obj_type = b'tag'
+
+
+def parse_kvlm(raw_block, start_idx=0, kv_map=None):
+    """
+    Parse a simple key-value message (like in commits/tags).
+    """
+    if kv_map is None:
+        kv_map = OrderedDict()
+
+    space_pos = raw_block.find(b' ', start_idx)
+    newline_pos = raw_block.find(b'\n', start_idx)
+
+    # Base case: if no more headers
+    if space_pos < 0 or newline_pos < space_pos:
+        kv_map[b''] = raw_block[start_idx + 1:]
+        return kv_map
+
+    key = raw_block[start_idx:space_pos]
+
+    line_ender = start_idx
+    while True:
+        line_ender = raw_block.find(b'\n', line_ender + 1)
+        if raw_block[line_ender + 1] != ord(' '):
+            break
+
+    value = raw_block[space_pos + 1:line_ender].replace(b'\n ', b'\n')
+
+    if key in kv_map:
+        if isinstance(kv_map[key], list):
+            kv_map[key].append(value)
+        else:
+            kv_map[key] = [kv_map[key], value]
+    else:
+        kv_map[key] = value
+
+    return parse_kvlm(raw_block, start_idx=line_ender + 1, kv_map=kv_map)
+
+
+def serialize_kvlm(kv_map):
+    """
+    Convert a key-value list message (kvlm) to bytes.
+    """
+    result = b''
+    for key in kv_map.keys():
+        if key == b'':
+            continue
+        val_list = kv_map[key] if isinstance(kv_map[key], list) else [kv_map[key]]
+        for val in val_list:
+            result += key + b' ' + val.replace(b'\n', b'\n ') + b'\n'
+    result += b'\n' + kv_map[b'']
+    return result
+
+
+def command_init(args):
+    create_repo(args.path)
+
+
+def command_cat_file(args):
+    repo = locate_existing_repo()
+    present_object(repo, args.object, expected_type=args.type)
+
+
+def command_hash_object(args):
+    repo = locate_existing_repo() if args.write else None
+
+    with open(args.path, "rb") as file_data:
+        content = file_data.read()
+
+    if args.type != "blob":
+        raise Exception("Unsupported type {} for hashing!".format(args.type))
+
+    candidate_obj = BlobObject(content)
+    if repo:
+        sha = write_object(candidate_obj, repo)
+    else:
+        # If not writing, just compute the hash
+        header = candidate_obj.obj_type + b' ' + str(len(content)).encode() + b'\x00' + content
+        sha = hashlib.sha1(header).hexdigest()
+    print(sha)
+
+
+def command_log(args):
+    repo = locate_existing_repo()
+    print("digraph commitlog {")
+    print("  rankdir=LR;")
+    visited_commits = set()
+    to_visit = [find_object(repo, args.commit)]
+
+    while to_visit:
+        sha = to_visit.pop()
+        if sha in visited_commits:
+            continue
+        visited_commits.add(sha)
+
+        commit = read_object(repo, sha)
+        print("  c_{0} [shape=rectangle, label=\"{0}\"];".format(sha))
+
+        if b'parent' not in commit.parsed_kvlm:
+            continue
+
+        parent_val = commit.parsed_kvlm[b'parent']
+        if not isinstance(parent_val, list):
+            parent_val = [parent_val]
+
+        for parent_sha in parent_val:
+            parent_sha_str = parent_sha.decode("ascii")
+            print("  c_{0} -> c_{1};".format(sha, parent_sha_str))
+            to_visit.append(parent_sha_str)
+    print("}")
+
+
+def command_ls_tree(args):
+    repo = locate_existing_repo()
+    tree_obj = read_object(repo, find_object(repo, args.object))
+    for mode, path_bytes, sha_val in tree_obj.tree_entries:
+        obj_type = "tree" if mode == "40000" else "blob"
+        print("{} {} {}\t{}".format(mode, obj_type, sha_val, path_bytes.decode("ascii")))
+
+
+def command_checkout(args):
+    repo = locate_existing_repo()
+    commit_sha = find_object(repo, args.commit)
+    if not commit_sha:
+        raise Exception("Unknown commit/reference: {}".format(args.commit))
+
+    commit_obj = read_object(repo, commit_sha)
+    tree_sha = commit_obj.parsed_kvlm[b'tree'].decode("ascii")
+
+    # Update HEAD
+    with open(ensure_git_file(repo, "HEAD"), "w") as head_file:
+        head_file.write(commit_sha)
+
+    # Clear the workspace (minus the .git directory)
+    for root, dirs, files in os.walk(repo.workspace):
+        if root.startswith(repo.git_directory):
+            continue
+        for f in files:
+            os.remove(os.path.join(root, f))
+        for d in dirs:
+            os.rmdir(os.path.join(root, d))
+
+    # Write out the tree
+    tree_obj = read_object(repo, tree_sha)
+    recursive_checkout(repo, tree_obj, repo.workspace)
+
+
+def recursive_checkout(repo, tree_obj, dest_path):
+    for mode, fname_bytes, sha_val in tree_obj.tree_entries:
+        target_path = os.path.join(dest_path, fname_bytes.decode("ascii"))
+        if mode == "40000":
+            os.mkdir(target_path)
+            subtree = read_object(repo, sha_val)
+            recursive_checkout(repo, subtree, target_path)
+        else:
+            with open(target_path, "wb") as out_file:
+                blob_data = read_object(repo, sha_val).serialize()
+                out_file.write(blob_data)
+
+
+def command_commit(args):
+    repo = locate_existing_repo()
+
+    # Identify parent commit (HEAD)
+    head_sha = find_object(repo, "HEAD")
+    if head_sha:
+        parent_commit = read_object(repo, head_sha)
+        parent_tree = parent_commit.parsed_kvlm[b'tree']
+    else:
+        parent_commit = None
+        parent_tree = None
+
+    # Generate new tree from workspace
+    new_tree_sha = build_tree_object(repo, repo.workspace)
+
+    # Create commit object
+    new_commit = CommitObject()
+    new_commit.parsed_kvlm = OrderedDict()
+    new_commit.parsed_kvlm[b'tree'] = new_tree_sha.encode()
+    if parent_commit:
+        new_commit.parsed_kvlm[b'parent'] = head_sha.encode()
+    new_commit.parsed_kvlm[b'author'] = args.author.encode()
+    new_commit.parsed_kvlm[b'committer'] = args.author.encode()
+    new_commit.parsed_kvlm[b''] = args.message.encode()
+
+    final_sha = write_object(new_commit, repo)
+
+    # Update HEAD
+    with open(ensure_git_file(repo, "HEAD"), "w") as head_file:
+        head_file.write(final_sha + "\n")
+
+    print("Committed to HEAD: {}".format(final_sha))
+
+
+def build_tree_object(repo, base_dir):
+    """
+    Recursively scan the directory and assemble a tree object,
+    returning its SHA-1.
+    """
+    tree_items = []
+    for root_path, dirs, files in os.walk(base_dir):
+        # Avoid .git
+        if ".git" in dirs:
+            dirs.remove(".git")
+        dirs.sort()
+        files.sort()
+        relative_root = os.path.relpath(root_path, base_dir)
+        for f in files:
+            file_rel_path = os.path.join(relative_root, f)
+            with open(os.path.join(root_path, f), "rb") as blob_file:
+                blob_obj = BlobObject(blob_file.read())
+            blob_sha = write_object(blob_obj, repo)
+            tree_items.append(("100644", file_rel_path, blob_sha))
+
+        # Recurse into subdirectories
+        for d in dirs:
+            subtree_rel_path = os.path.join(relative_root, d)
+            subtree_sha = build_tree_object(repo, os.path.join(root_path, d))
+            tree_items.append(("40000", subtree_rel_path, subtree_sha))
+
+        # Only process the top-level of this call's directory
+        break
+
+    tree_obj = TreeObject()
+    tree_obj.tree_entries = []
+    for mode, rel_path, sha_hex in tree_items:
+        tree_obj.tree_entries.append((mode, rel_path.encode("ascii"), sha_hex))
+    return write_object(tree_obj, repo)
+
+
+def command_tag(args):
+    repo = locate_existing_repo()
+    target_sha = find_object(repo, args.object)
+    if not target_sha:
+        raise Exception("Cannot locate object: {}".format(args.object))
+
+    new_tag = TagObject()
+    new_tag.parsed_kvlm = OrderedDict()
+    new_tag.parsed_kvlm[b'object'] = target_sha.encode("ascii")
+    new_tag.parsed_kvlm[b'type'] = b'commit'
+    new_tag.parsed_kvlm[b'tag'] = args.tagname.encode("ascii")
+    new_tag.parsed_kvlm[b'tagger'] = args.author.encode("ascii")
+    new_tag.parsed_kvlm[b''] = args.message.encode("ascii")
+
+    tag_sha = write_object(new_tag, repo)
+    tag_path = ensure_git_file(repo, "refs", "tags", args.tagname)
+    with open(tag_path, "w") as tag_file:
+        tag_file.write(tag_sha + "\n")
+
+    print("Created tag '{}' -> {}".format(args.tagname, tag_sha))
+
+
+def command_rev_parse(args):
+    repo = locate_existing_repo()
+    print(find_object(repo, args.rev))
 
 
 def main(argv=sys.argv[1:]):
-    args = argparser.parse_args(argv)
-    match args.command:
-        case "add"          : cmd_add(args)
-        case "cat-file"     : cmd_cat_file(args)
-        case "check-ignore" : cmd_check_ignore(args)
-        case "checkout"     : cmd_checkout(args)
-        case "commit"       : cmd_commit(args)
-        case "hash-object"  : cmd_hash_object(args)
-        case "init"         : cmd_init(args)
-        case "log"          : cmd_log(args)
-        case "ls-files"     : cmd_ls_files(args)
-        case "ls-tree"      : cmd_ls_tree(args)
-        case "rev-parse"    : cmd_rev_parse(args)
-        case "rm"           : cmd_rm(args)
-        case "show-ref"     : cmd_show_ref(args)
-        case "status"       : cmd_status(args)
-        case "tag"          : cmd_tag(args)
-        case _              : print("Bad command.")
+    parser = argparse.ArgumentParser(description="A simplified Git-like content tracker.")
+    subcommands = parser.add_subparsers(title="Available commands", dest="command")
+    subcommands.required = True
+
+    # init
+    init_cmd = subcommands.add_parser("init", help="Initialize a new repository.")
+    init_cmd.add_argument("path", metavar="directory", nargs="?", default=".", help="Target repository directory.")
+    init_cmd.set_defaults(func=command_init)
+
+    # cat-file
+    catfile_cmd = subcommands.add_parser("cat-file", help="Show the contents of a Git object.")
+    catfile_cmd.add_argument("type", metavar="type", choices=["blob", "commit", "tag", "tree"], help="Object type.")
+    catfile_cmd.add_argument("object", help="Object to display.")
+    catfile_cmd.set_defaults(func=command_cat_file)
+
+    # hash-object
+    hashobj_cmd = subcommands.add_parser("hash-object", help="Compute and optionally store the object’s SHA-1.")
+    hashobj_cmd.add_argument("-t", "--type", choices=["blob"], default="blob", help="Specify the type of object.")
+    hashobj_cmd.add_argument("-w", "--write", action="store_true", help="Store the object in the repository.")
+    hashobj_cmd.add_argument("path", help="File to be hashed.")
+    hashobj_cmd.set_defaults(func=command_hash_object)
+
+    # log
+    log_cmd = subcommands.add_parser("log", help="Display the history leading up to a commit.")
+    log_cmd.add_argument("commit", default="HEAD", nargs="?", help="Commit to traverse from.")
+    log_cmd.set_defaults(func=command_log)
+
+    # ls-tree
+    lstree_cmd = subcommands.add_parser("ls-tree", help="List the contents of a tree object.")
+    lstree_cmd.add_argument("object", help="Tree object to display.")
+    lstree_cmd.set_defaults(func=command_ls_tree)
+
+    # checkout
+    checkout_cmd = subcommands.add_parser("checkout", help="Check out a commit into the working directory.")
+    checkout_cmd.add_argument("commit", help="Commit (or branch) to check out.")
+    checkout_cmd.set_defaults(func=command_checkout)
+
+    # commit
+    commit_cmd = subcommands.add_parser("commit", help="Commit current workspace to the repository.")
+    commit_cmd.add_argument("-m", "--message", required=True, help="Commit message.")
+    commit_cmd.add_argument("--author", default="Example <example@example.com>", help="Author name and email.")
+    commit_cmd.set_defaults(func=command_commit)
+
+    # tag
+    tag_cmd = subcommands.add_parser("tag", help="Create a new tag object.")
+    tag_cmd.add_argument("tagname", help="Name of the new tag.")
+    tag_cmd.add_argument("object", nargs="?", default="HEAD", help="Object the tag should point to.")
+    tag_cmd.add_argument("-m", "--message", default="", help="Tag message.")
+    tag_cmd.add_argument("--author", default="Example <example@example.com>", help="Tagger name and email.")
+    tag_cmd.set_defaults(func=command_tag)
+
+    # rev-parse
+    revparse_cmd = subcommands.add_parser("rev-parse", help="Resolve a revision to a full SHA-1.")
+    revparse_cmd.add_argument("rev", help="The revision name/commit-ish.")
+    revparse_cmd.set_defaults(func=command_rev_parse)
+
+    parsed_args = parser.parse_args(argv)
+    parsed_args.func(parsed_args)
+
+
+if __name__ == "__main__":
+    main()

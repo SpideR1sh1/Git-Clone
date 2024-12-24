@@ -169,5 +169,10 @@ python wyag.py cat-file blob <SHA-1>
 
 ---
 
+### **Acknowledgments**
+- Sincere thanks to **Thibault Polge**, whose *“Write Yourself a Git”* tutorial served as an invaluable learning resource and foundation for this implementation.
+
+---
+
 ## **License**
 This project is licensed under the MIT License.
